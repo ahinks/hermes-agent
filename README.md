@@ -178,8 +178,158 @@ python -m pytest tests/ -q
 
 ---
 
+## HinksBot: Autonomous Self-Improving Fork
+
+This fork runs on a dedicated homelab server and maintains a fully autonomous self-improvement loop. All changes from this fork are pushed to [ahinks/hermes-agent](https://github.com/ahinks/hermes-agent) on the `feat/layered-delegation-circuit-breaker` branch.
+
+### What's Different in This Fork
+
+This fork diverges from upstream NousResearch/hermes-agent in several significant ways:
+
+- **Layered delegation (MAX_DEPTH=3):** orchestrator → tactical → execution → worker layers, with per-layer system prompts and circuit breakers
+- **Subagent retry with exponential backoff:** SimpleCircuitBreaker (closed/open/half_open states), transient error classification, up to 3 retries
+- **Session failure logging:** `_log_session_failure()` in run_agent.py for post-mortem recovery analysis
+- **Unified memory retrieval:** 5-store parallel search (KG, Chroma, SessionDB, Wiki, Corrections) with weighted fusion
+- **Self-improvement pipeline:** corrections-applier.py, skill-regression-tester.py, auto-reflexion, error-pattern-memory, adaptive memory pruning
+- **5-stream research:** max-research-runner.py fans out 5 parallel search/extract/KG-filing streams every 30 minutes
+- **Skills system:** 131+ skills loaded at runtime, with autonomous skill generation on complex tasks
+
+### Architecture Overview
+
+```
+hermes-agent (NousResearch distributed repo)
+  └── ~/.hermes/hermes-agent/    ← git worktree / fork
+  └── ~/.hermes/                 ← HinksBot runtime home
+      ├── scripts/               ← Autonomous loops, maintenance, KG tools
+      ├── skills/               ← Runtime-loaded skills (131 pass / 2 skip)
+      ├── workspace/            ← Loop outputs, regression ledgers, reports
+      ├── self-improving/       ← Corrections ledger, regression ledger
+      ├── data/performance/     ← Metrics DB
+      ├── logs/                 ← Log files
+      └── backups/              ← Daily compressed tarballs (auto-backup.sh)
+
+.mempalace/                      ← MemPalace memory system
+  └── knowledge_graph.sqlite3   ← ~6,031 active KG triples
+  └── chroma.sqlite3            ← Vector embeddings
+  └── mempalace.db              ← Palace metadata
+
+Runtime loops (cron-triggered):
+  max-si-ticker-15min    every 15min   ← Health, smoke, KG, corrections, skill gen, regression
+  max-research-30min    every 30min    ← 5-stream research → KG filing
+  watchdog-30min         every 30min    ← Health check watchdog
+  hinksbot-backup       daily 03:00    ← tar.gz to workspace/backups/
+  weekly KG maintenance  Sun 04:00     ← Predicate collapse, entity resolution, PageRank
+```
+
+### Rebuilding From Scratch
+
+If you were rebuilding this system on a fresh machine:
+
+**Step 1: Install hermes-agent**
+```bash
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+```
+
+**Step 2: Clone this fork**
+```bash
+git clone https://github.com/ahinks/hermes-agent.git ~/.hermes/hermes-agent
+cd ~/.hermes/hermes-agent
+git checkout feat/layered-delegation-circuit-breaker
+```
+
+**Step 3: Set up HinksBot runtime directories**
+```bash
+mkdir -p ~/.hermes/{scripts,skills,workspace,logs,backups,self-improving,data/performance}
+mkdir -p ~/.mempalace/
+```
+
+**Step 4: Copy autonomous scripts** (these live outside the git repo in ~/.hermes/scripts/):
+Key scripts to restore from backup or rebuild:
+- `max-si-ticker.py` — 9-phase SI loop (15min cycle)
+- `max-research-runner.py` — 5-stream research (30min cycle)
+- `corrections-applier.py` — SelfRefine → code patch pipeline
+- `skill-regression-tester.py` — regression detection ledger
+- `unified_memory_retriever.py` — 5-store parallel memory search
+- `kg-maintenance.py` — KG cleanup (DELETE sessions, garbage predicates, importance scores)
+- `topic-generator.py` — dynamic topic seeding for research streams
+- `auto-reflexion.py` — reflective analysis on failures
+- `error-pattern-memory.py` — pattern extraction from smoke failures
+- `self-refine-loop.py` — iterative self-improvement on smoke failures
+- `entity_resolver.py` — KG entity deduplication
+- `stigmergic-coordinator.py` — cross-loop coordination signals
+- `adaptive_forgetting.py` — importance-driven KG pruning
+- `health-check-suite.sh` — 12-point health check
+- `run-skill-tests.sh` — skill smoke tests
+- `auto-backup.sh` — daily compressed backup to workspace/backups/
+- `watchdog.sh` — health watchdog
+
+All scripts: `~/.hermes/scripts/`
+All skills: `~/.hermes/skills/`
+
+**Step 5: Set up MemPalace KG**
+```bash
+# knowledge_graph.sqlite3 at ~/.mempalace/knowledge_graph.sqlite3
+# Schema: id TEXT, subject TEXT, predicate TEXT, object TEXT, entity TEXT,
+#         valid_from TEXT, valid_to TEXT, confidence REAL, importance_score REAL
+# (NOTE: column is 'entity' NOT 'entity_id')
+```
+
+**Step 6: Configure providers**
+```bash
+hermes setup          # Full setup wizard
+hermes model          # Set provider and model (MiniMax-M2.7 recommended)
+hermes tools          # Enable desired toolsets
+```
+
+**Step 7: Restore cron jobs** (from cronjob list output above):
+```bash
+hermes cron create --name max-si-ticker-15min \
+  --prompt "python3 ~/.hermes/scripts/max-si-ticker.py" \
+  --schedule "*/15 * * * *"
+
+hermes cron create --name max-research-30min \
+  --prompt "python3 ~/.hermes/scripts/max-research-runner.py" \
+  --schedule "*/30 * * * *"
+
+hermes cron create --name watchdog-30min \
+  --prompt "bash ~/.hermes/scripts/watchdog.sh check" \
+  --schedule "*/30 * * * *"
+
+hermes cron create --name hinksbot-backup \
+  --prompt "bash ~/.hermes/scripts/auto-backup.sh" \
+  --schedule "0 3 * * *"
+```
+
+### Key Files and Their Locations
+
+| What | Where |
+|------|-------|
+| Agent code (fork) | `~/.hermes/hermes-agent/` |
+| HinksBot runtime home | `~/.hermes/` |
+| MemPalace KG | `~/.mempalace/knowledge_graph.sqlite3` |
+| Skill registry | `~/.hermes/skills/` (131 skills) |
+| KG column name | `entity` (NOT `entity_id`) |
+| Corrections ledger | `~/.hermes/self-improving/.corrections-ledger.json` |
+| Regression ledger | `~/.hermes/workspace/regression-ledger.json` |
+| Backup archive | `~/.hermes/workspace/backups/YYYY-MM-DD/hinksbot-backup-YYYY-MM-DD.tar.gz` |
+| ddgs CLI | `/home/alexanderh/ai-tools/venv/bin/ddgs` |
+| Qwen instances | `:8080` (262K ctx), `:8081` (32K ctx) |
+
+### Health and Status
+
+| Indicator | Status |
+|-----------|--------|
+| Health check | 12/12 PASS |
+| Skills | 131 pass / 2 skip / 0 fail |
+| KG active triples | ~6,031 |
+| RAM available | 68GB |
+| Backup DB files | ✅ Fixed (was missing, now included) |
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
 
 Built by [Nous Research](https://nousresearch.com).
+HinksBot customizations by [Alexander Hinks](https://github.com/ahinks/hermes-agent).
