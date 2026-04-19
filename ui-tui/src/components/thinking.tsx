@@ -504,19 +504,19 @@ export const Thinking = memo(function Thinking({
               <Text color={t.color.dim} dim key={index} wrap="wrap-trim">
                 {line || ' '}
                 {index === lines.length - 1 ? (
-                  <StreamCursor color={t.color.dim} dimColor streaming={streaming} visible={active} />
+                  active ? <Spinner color={t.color.amber} variant="think" /> : <StreamCursor color={t.color.dim} dimColor streaming={streaming} visible={active} />
                 ) : null}
               </Text>
             ))
           ) : (
             <Text color={t.color.dim} dim wrap="truncate-end">
-              {preview}
-              <StreamCursor color={t.color.dim} dimColor streaming={streaming} visible={active} />
+              {preview}{' '}
+              {active ? <Spinner color={t.color.amber} variant="think" /> : <StreamCursor color={t.color.dim} dimColor streaming={streaming} visible={active} />}
             </Text>
           )
         ) : (
           <Text color={t.color.dim} dim>
-            <StreamCursor color={t.color.dim} dimColor streaming={streaming} visible={active} />
+            {active ? <Spinner color={t.color.amber} variant="think" /> : <StreamCursor color={t.color.dim} dimColor streaming={streaming} visible={active} />}
           </Text>
         )}
       </Box>

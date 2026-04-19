@@ -50,7 +50,8 @@ _SUBAGENT_TOOLSETS = sorted(
 _TOOLSET_LIST_STR = ", ".join(f"'{n}'" for n in _SUBAGENT_TOOLSETS)
 
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 3
-MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
+MAX_DEPTH = 3  # orchestrator(0) -> tactical(1) -> execution(2) -> worker(3)
+LAYER_NAMES = {0: "orchestrator", 1: "tactical", 2: "execution", 3: "worker"}
 
 
 def _get_max_concurrent_children() -> int:
@@ -81,6 +82,86 @@ DEFAULT_MAX_ITERATIONS = 50
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 
+# Subagent retry + circuit breaker defaults
+_SUBAGENT_MAX_RETRIES = 3          # retry transient failures up to this many times
+_SUBAGENT_RETRY_BASE_DELAY = 3.0   # seconds, exponential backoff applied on each retry
+_SUBAGENT_CIRCUIT_BREAKER_THRESHOLD = 3  # failures before open state
+_SUBAGENT_CIRCUIT_BREAKER_COOLDOWN = 60.0  # seconds before half-open retry
+
+# Transient error subclasses that warrant a retry
+_SUBAGENT_TRANSIENT_EXCEPTIONS = (
+    OSError,           # network / pipe issues
+    TimeoutError,      # operation timed out
+    ConnectionError,   # connection refused / reset
+    BrokenPipeError,   # pipe closed during write
+    EOFError,          # unexpected EOF
+)
+# HTTP status codes that indicate transient failures (children use httpx internally)
+_SUBAGENT_TRANSIENT_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+
+class SimpleCircuitBreaker:
+    """
+    Minimal circuit breaker for subagent health management.
+
+    States:
+      CLOSED  -> Normal operation, requests pass through.
+                 Failures increment a counter; trips at threshold.
+      OPEN    -> Circuit is tripped; requests fail fast without trying.
+                 After cooldown, transitions to HALF-OPEN.
+      HALF_OPEN -> One probe request is allowed.
+                   Success -> CLOSED (reset).
+                   Failure -> OPEN (restart cooldown).
+
+    This is a per-task-circuit design -- each task gets its own breaker,
+    so one crashed subagent doesn't affect its siblings.
+    """
+
+    __slots__ = ("_failures", "_last_failure_time", "_state", "_probe_inflight")
+
+    def __init__(
+        self,
+        threshold: int = _SUBAGENT_CIRCUIT_BREAKER_THRESHOLD,
+        cooldown: float = _SUBAGENT_CIRCUIT_BREAKER_COOLDOWN,
+    ):
+        self._failures = 0
+        self._last_failure_time = 0.0
+        self._state = "closed"
+        self._probe_inflight = False
+
+    @property
+    def state(self) -> str:
+        if self._state == "open":
+            if (time.time() - self._last_failure_time) >= _SUBAGENT_CIRCUIT_BREAKER_COOLDOWN:
+                self._state = "half_open"
+                self._probe_inflight = True
+        return self._state
+
+    def is_available(self) -> bool:
+        return self.state != "open"
+
+    def record_success(self) -> None:
+        self._failures = 0
+        self._state = "closed"
+        self._probe_inflight = False
+
+    def record_failure(self) -> None:
+        self._failures += 1
+        self._last_failure_time = time.time()
+        if self._state == "half_open":
+            self._state = "open"
+        elif self._failures >= _SUBAGENT_CIRCUIT_BREAKER_THRESHOLD:
+            self._state = "open"
+
+    def failure_count(self) -> int:
+        return self._failures
+
+    def reset(self) -> None:
+        """Manually reset the breaker to closed state."""
+        self._failures = 0
+        self._state = "closed"
+        self._probe_inflight = False
+
 
 def check_delegate_requirements() -> bool:
     """Delegation has no external requirements -- always available."""
@@ -92,10 +173,23 @@ def _build_child_system_prompt(
     context: Optional[str] = None,
     *,
     workspace_path: Optional[str] = None,
+    layer: int = 1,
 ) -> str:
     """Build a focused system prompt for a child agent."""
+    layer_label = LAYER_NAMES.get(layer, f"layer{layer}")
+    layer_color = {"orchestrator": "0", "tactical": "1", "execution": "2", "worker": "3"}.get(layer_label, str(layer))
+
+    layer_roles = {
+        1: "Tactical Coordinator -- receives broad goals and decomposes them into concrete sub-tasks for specialized agents. You delegate, you do NOT execute work yourself.",
+        2: "Execution Agent -- receives focused, concrete tasks. You execute directly using available tools. Report completion with specific results.",
+        3: "Worker Agent -- receives tightly-scoped, single-purpose tasks. Execute precisely and report exactly what was done. No further delegation.",
+    }
+    role_desc = layer_roles.get(layer, f"Layer {layer} agent")
+
     parts = [
-        "You are a focused subagent working on a specific delegated task.",
+        f"[Layer {layer} ({layer_label}) Agent]",
+        "",
+        f"You are a {role_desc}",
         "",
         f"YOUR TASK:\n{goal}",
     ]
@@ -279,6 +373,7 @@ def _build_child_agent(
     # ACP transport overrides — lets a non-ACP parent spawn ACP child agents
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    layer: int = 1,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -319,7 +414,7 @@ def _build_child_agent(
         child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
-    child_prompt = _build_child_system_prompt(goal, context, workspace_path=workspace_hint)
+    child_prompt = _build_child_system_prompt(goal, context, workspace_path=workspace_hint, layer=layer)
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
@@ -423,6 +518,104 @@ def _build_child_agent(
             parent_agent._active_children.append(child)
 
     return child
+
+
+def _run_single_child_with_retry(
+    task_index: int,
+    goal: str,
+    child,
+    parent_agent,
+    circuit_breaker: SimpleCircuitBreaker,
+) -> Dict[str, Any]:
+    """
+    Wrap _run_single_child with:
+      - Per-task circuit breaker (open -> fail fast without retrying)
+      - Exponential-backoff retry for transient exceptions
+      - Status-code-aware retry for HTTP errors emitted in subagent result dicts
+
+    Returns the same dict shape as _run_single_child.
+    """
+    last_error: str = "unknown"
+    status_override: str | None = None   # set when circuit is open
+
+    # --- Fast-fail path: circuit breaker is open ---
+    if not circuit_breaker.is_available():
+        state = circuit_breaker.state
+        logger.debug(
+            "[subagent-%d] Circuit breaker %s — returning fast-fail without retrying",
+            task_index, state,
+        )
+        return {
+            "task_index": task_index,
+            "status": "circuit_open",
+            "summary": None,
+            "error": f"Circuit breaker open (state={state}), skipping subagent",
+            "api_calls": 0,
+            "duration_seconds": 0.0,
+        }
+
+    # --- Retry loop ---
+    for attempt in range(_SUBAGENT_MAX_RETRIES + 1):
+        try:
+            result = _run_single_child(
+                task_index=task_index,
+                goal=goal,
+                child=child,
+                parent_agent=parent_agent,
+            )
+
+            # --- Success ---
+            if result.get("status") not in ("error", "failed"):
+                circuit_breaker.record_success()
+                return result
+
+            # --- Subagent returned an error dict (child threw but was caught internally) ---
+            last_error = result.get("error", "")
+            http_status = result.get("http_status") or result.get("status_code")
+
+            # Treat specific HTTP status codes as transient (retry-worthy)
+            if http_status in _SUBAGENT_TRANSIENT_STATUS_CODES:
+                logger.warning(
+                    "[subagent-%d] HTTP %s on attempt %d/%d — retrying after backoff",
+                    task_index, http_status, attempt + 1, _SUBAGENT_MAX_RETRIES + 1,
+                )
+            else:
+                # Non-transient failure: break retry loop, record and propagate
+                circuit_breaker.record_failure()
+                logger.debug(
+                    "[subagent-%d] Non-transient subagent error (attempt %d): %s",
+                    task_index, attempt + 1, last_error[:200],
+                )
+                result["status"] = "failed"
+                return result
+
+        except _SUBAGENT_TRANSIENT_EXCEPTIONS as exc:
+            last_error = str(exc)
+            logger.warning(
+                "[subagent-%d] Transient exception on attempt %d/%d: %s — retrying",
+                task_index, attempt + 1, _SUBAGENT_MAX_RETRIES + 1, type(exc).__name__,
+            )
+
+        # --- Exponential backoff before retry ---
+        if attempt < _SUBAGENT_MAX_RETRIES:
+            delay = _SUBAGENT_RETRY_BASE_DELAY * (2 ** attempt)
+            time.sleep(delay)
+
+    # --- All retries exhausted ---
+    circuit_breaker.record_failure()
+    logger.error(
+        "[subagent-%d] All %d retries exhausted. Last error: %s",
+        task_index, _SUBAGENT_MAX_RETRIES + 1, last_error[:300],
+    )
+    return {
+        "task_index": task_index,
+        "status": "error",
+        "summary": None,
+        "error": f"Subagent failed after {_SUBAGENT_MAX_RETRIES + 1} attempts. Last error: {last_error}",
+        "api_calls": 0,
+        "duration_seconds": 0.0,
+    }
+
 
 def _run_single_child(
     task_index: int,
@@ -686,22 +879,28 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     parent_agent=None,
+    layer: Optional[int] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
       - Single: provide goal (+ optional context, toolsets)
-      - Batch:  provide tasks array [{goal, context, toolsets}, ...]
+      - Batch:  provide tasks array [{goal, context, toolsets, layer}, ...]
+
+    Layer controls the role of spawned agents:
+      - Layer 1 (tactical): coordinates and decomposes goals
+      - Layer 2 (execution): executes concrete sub-tasks
+      - Layer 3 (worker): performs single-purpose tasks, cannot delegate further
 
     Returns JSON with results array, one entry per task.
     """
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
-    # Depth limit
+    # Depth limit (depth > MAX_DEPTH so exactly MAX_DEPTH is allowed)
     depth = getattr(parent_agent, '_delegate_depth', 0)
-    if depth >= MAX_DEPTH:
+    if depth > MAX_DEPTH:
         return json.dumps({
             "error": (
                 f"Delegation depth limit reached ({MAX_DEPTH}). "
@@ -737,7 +936,7 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "toolsets": toolsets}]
+        task_list = [{"goal": goal, "context": context, "toolsets": toolsets, "layer": layer if layer is not None else 1}]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -768,6 +967,7 @@ def delegate_task(
     children = []
     try:
         for i, t in enumerate(task_list):
+            child_layer = t.get("layer", layer if layer is not None else 1)
             child = _build_child_agent(
                 task_index=i, goal=t["goal"], context=t.get("context"),
                 toolsets=t.get("toolsets") or toolsets, model=creds["model"],
@@ -777,6 +977,7 @@ def delegate_task(
                 override_api_mode=creds["api_mode"],
                 override_acp_command=t.get("acp_command") or acp_command,
                 override_acp_args=t.get("acp_args") or acp_args,
+                layer=child_layer,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -788,22 +989,29 @@ def delegate_task(
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
         _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
+        cb = SimpleCircuitBreaker()
+        result = _run_single_child_with_retry(0, _t["goal"], child, parent_agent, cb)
         results.append(result)
     else:
         # Batch -- run in parallel with per-task progress lines
         completed_count = 0
         spinner_ref = getattr(parent_agent, '_delegate_spinner', None)
 
+        # Per-task circuit breakers so one crashed subagent doesn't affect siblings
+        task_circuit_breakers: Dict[int, SimpleCircuitBreaker] = {
+            i: SimpleCircuitBreaker() for i, _, _ in children
+        }
+
         with ThreadPoolExecutor(max_workers=max_children) as executor:
             futures = {}
             for i, t, child in children:
                 future = executor.submit(
-                    _run_single_child,
+                    _run_single_child_with_retry,
                     task_index=i,
                     goal=t["goal"],
                     child=child,
                     parent_agent=parent_agent,
+                    circuit_breaker=task_circuit_breakers[i],
                 )
                 futures[future] = i
 
@@ -1137,6 +1345,10 @@ DELEGATE_TASK_SCHEMA = {
                             "items": {"type": "string"},
                             "description": "Per-task ACP args override.",
                         },
+                        "layer": {
+                            "type": "integer",
+                            "description": "Delegation layer: 1=tactical, 2=execution, 3=worker. Default 1.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -1171,6 +1383,17 @@ DELEGATE_TASK_SCHEMA = {
                 "description": (
                     "Arguments for the ACP command (default: ['--acp', '--stdio']). "
                     "Only used when acp_command is set. Example: ['--acp', '--stdio', '--model', 'claude-opus-4-6']"
+                ),
+            },
+            "layer": {
+                "type": "integer",
+                "description": (
+                    "Delegation layer for spawned agents: "
+                    "1=tactical (coordinates, decomposes goals), "
+                    "2=execution (executes concrete sub-tasks), "
+                    "3=worker (tightly-scoped tasks, cannot delegate further). "
+                    "Default: 1. Only applies to single-task mode (goal=); "
+                    "batch mode uses per-task layer values."
                 ),
             },
         },

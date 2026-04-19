@@ -109,6 +109,18 @@ from agent.trajectory import (
 )
 from utils import atomic_json_write, env_var_enabled
 
+# Session recovery logger — records failures for post-mortem analysis and recovery
+try:
+    from scripts.session_recovery_logger import SessionRecoveryLogger, SessionEndState, ErrorSource
+    _session_recovery_logger: Optional["SessionRecoveryLogger"] = None  # lazy init
+    def _get_session_recovery_logger() -> "SessionRecoveryLogger":
+        global _session_recovery_logger
+        if _session_recovery_logger is None:
+            _session_recovery_logger = SessionRecoveryLogger()
+        return _session_recovery_logger
+except ImportError:
+    _get_session_recovery_logger = None  # Not available
+
 
 
 class _SafeWriter:
@@ -2692,6 +2704,48 @@ class AIAgent:
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
+
+    def _log_session_failure(
+        self,
+        end_state: "SessionEndState",
+        error_source: "ErrorSource",
+        error_message: Optional[str] = None,
+        error_code: Optional[str] = None,
+        recovery_action: Optional[str] = None,
+        last_tool_name: Optional[str] = None,
+        api_call_count: int = 0,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
+        duration_seconds: float = 0.0,
+        notes: str = "",
+    ) -> None:
+        """Log a session failure to the recovery logger for post-mortem analysis.
+
+        Safe to call even when the recovery logger is unavailable -- logs a warning
+        but never raises.
+        """
+        if _get_session_recovery_logger is None:
+            return
+        try:
+            rl = _get_session_recovery_logger()
+            rl.log_failure(
+                session_id=self.session_id,
+                end_state=end_state,
+                error_source=error_source,
+                error_message=error_message,
+                error_code=error_code,
+                provider=getattr(self, "provider", None),
+                model=getattr(self, "model", None),
+                recovery_action=recovery_action,
+                last_tool_name=last_tool_name,
+                api_call_count=api_call_count,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                duration_seconds=duration_seconds,
+                notes=notes,
+            )
+        except Exception:
+            logger.debug("Session recovery logger unavailable -- skipping failure log")
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
         """
@@ -9653,6 +9707,15 @@ class AIAgent:
                             self._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
                             logging.error(f"{self.log_prefix}Invalid API response after {max_retries} retries.")
                             self._persist_session(messages, conversation_history)
+                            self._log_session_failure(
+                                end_state=SessionEndState.ERROR,
+                                error_source=ErrorSource.API_ERROR,
+                                error_message=f"Invalid API response after {max_retries} retries: {_failure_hint}",
+                                recovery_action="fallback",
+                                api_call_count=api_call_count,
+                                tokens_in=approx_tokens,
+                                notes=f"error_details={error_details}",
+                            )
                             return {
                                 "messages": messages,
                                 "completed": False,
@@ -10508,6 +10571,16 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logging.error(f"{self.log_prefix}413 compression failed after {max_compression_attempts} attempts.")
                             self._persist_session(messages, conversation_history)
+                            # Log compression exhaustion to recovery logger before returning
+                            self._log_session_failure(
+                                end_state=SessionEndState.CONTEXT_OVERFLOW,
+                                error_source=ErrorSource.API_ERROR,
+                                error_message=f"Request payload too large: max compression attempts ({max_compression_attempts}) reached.",
+                                recovery_action="compress",
+                                api_call_count=api_call_count,
+                                tokens_in=approx_tokens,
+                                notes=f"413 payload_too_large, compression_attempts={compression_attempts}",
+                            )
                             return {
                                 "messages": messages,
                                 "completed": False,
@@ -10539,6 +10612,15 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logging.error(f"{self.log_prefix}413 payload too large. Cannot compress further.")
                             self._persist_session(messages, conversation_history)
+                            self._log_session_failure(
+                                end_state=SessionEndState.CONTEXT_OVERFLOW,
+                                error_source=ErrorSource.API_ERROR,
+                                error_message="Request payload too large (413). Cannot compress further.",
+                                recovery_action="compress",
+                                api_call_count=api_call_count,
+                                tokens_in=approx_tokens,
+                                notes="413 cannot compress further",
+                            )
                             return {
                                 "messages": messages,
                                 "completed": False,
@@ -10592,6 +10674,15 @@ class AIAgent:
                                 self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                                 logging.error(f"{self.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
                                 self._persist_session(messages, conversation_history)
+                                self._log_session_failure(
+                                    end_state=SessionEndState.CONTEXT_OVERFLOW,
+                                    error_source=ErrorSource.API_ERROR,
+                                    error_message=f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached.",
+                                    recovery_action="compress",
+                                    api_call_count=api_call_count,
+                                    tokens_in=approx_tokens,
+                                    notes=f"context_overflow compression exhausted, compression_attempts={compression_attempts}",
+                                )
                                 return {
                                     "messages": messages,
                                     "completed": False,
@@ -10644,6 +10735,15 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logging.error(f"{self.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
                             self._persist_session(messages, conversation_history)
+                            self._log_session_failure(
+                                end_state=SessionEndState.CONTEXT_OVERFLOW,
+                                error_source=ErrorSource.API_ERROR,
+                                error_message=f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached.",
+                                recovery_action="compress",
+                                api_call_count=api_call_count,
+                                tokens_in=approx_tokens,
+                                notes=f"context_overflow exhausted (input reduction), compression_attempts={compression_attempts}",
+                            )
                             return {
                                 "messages": messages,
                                 "completed": False,
@@ -10677,6 +10777,15 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
                             logging.error(f"{self.log_prefix}Context length exceeded: {approx_tokens:,} tokens. Cannot compress further.")
                             self._persist_session(messages, conversation_history)
+                            self._log_session_failure(
+                                end_state=SessionEndState.CONTEXT_OVERFLOW,
+                                error_source=ErrorSource.API_ERROR,
+                                error_message=f"Context length exceeded ({approx_tokens:,} tokens). Cannot compress further.",
+                                recovery_action="compress",
+                                api_call_count=api_call_count,
+                                tokens_in=approx_tokens,
+                                notes="context_overflow cannot compress further, at minimum tier",
+                            )
                             return {
                                 "messages": messages,
                                 "completed": False,
@@ -10834,6 +10943,19 @@ class AIAgent:
                                 api_kwargs, reason="max_retries_exhausted", error=api_error,
                             )
                         self._persist_session(messages, conversation_history)
+                        # Log to session recovery system for post-mortem analysis
+                        _err_src = ErrorSource.RATE_LIMIT if is_rate_limited else ErrorSource.API_ERROR
+                        _err_act = "fallback" if is_rate_limited else "retry"
+                        _err_code = str(getattr(api_error, "status_code", "")) if hasattr(api_error, "status_code") else None
+                        self._log_session_failure(
+                            end_state=SessionEndState.ERROR,
+                            error_source=_err_src,
+                            error_message=_final_summary,
+                            error_code=_err_code,
+                            recovery_action=_err_act,
+                            api_call_count=api_call_count,
+                            tokens_in=approx_tokens,
+                        )
                         _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
                         if _is_stream_drop:
                             _final_response += (
