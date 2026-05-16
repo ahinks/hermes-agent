@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "exa": {
+      "baseUrl": "https://mcp.exa.ai/mcp"
+    },
+    "unsearch": {
+      "description": "UnSearch - Self-hosted search API for AI agents. Queries 70+ engines (Google, Bing, GitHub, arXiv, Reddit, etc.)",
+      "baseUrl": "http://localhost:8000/mcp"
+    }
+  },
+  "imports": []
+}

@@ -1,0 +1,6 @@
+name: jitrl
+description: JitRL — Just-in-Time experience recall. Searches past HinksBot experiences for relevant fixes, approaches, and outcomes, injected as context before each LLM call.
+category: memory
+version: 1.0.0
+hermes_version: ">=0.9.0"
+author: HinksBot SI Team
