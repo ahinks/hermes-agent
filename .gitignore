@@ -70,3 +70,8 @@ mini-swe-agent/
 result
 website/static/api/skills-index.json
 models-dev-upstream/
+state.db
+gateway/platforms/discord.db
+.claude/
+.gitnexus/
+deep-audit-round-2-20260512.md
