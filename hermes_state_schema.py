@@ -208,6 +208,20 @@ class SessionSchemaMixin:
                         cursor.execute(
                             f'ALTER TABLE "{table_name}" ADD COLUMN "{safe_name}" {col_type}'
                         )
+                        # Backfill NULLs to 0 for tri-state boolean columns
+                        # (archived / pinned / cost_status / etc.). The schema
+                        # declares these as `INTEGER NOT NULL DEFAULT 0`, but
+                        # SQLite's bare ADD COLUMN leaves existing rows as
+                        # NULL when the modifier isn't restated — and the
+                        # `=` comparisons downstream (`s.archived = 0`,
+                        # `s.pinned = 1`) treat NULL as non-matching, so a
+                        # NULL-backed column silently excludes every listable
+                        # row. One UPDATE, idempotent and free to re-run.
+                        if col_type.upper().startswith("INTEGER") and "DEFAULT 0" in col_type.upper():
+                            cursor.execute(
+                                f'UPDATE "{table_name}" SET "{safe_name}" = 0 '
+                                f'WHERE "{safe_name}" IS NULL'
+                            )
                     except sqlite3.OperationalError as exc:
                         # Expected: "duplicate column name" from a race or
                         # re-run.  Unexpected: "Cannot add a NOT NULL column
