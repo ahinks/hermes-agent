@@ -206,17 +206,37 @@ async def _lifespan(app: "FastAPI"):
     # Desktop-spawned backends (HERMES_DESKTOP=1) fire cron jobs themselves,
     # since the app has no gateway running the scheduler. Server `hermes
     # dashboard` is unaffected — it relies on its own gateway.
+    #
+    # But when a real gateway IS already running on the same HERMES_HOME
+    # (its pid file exists and the process is alive), the desktop ticker is
+    # redundant: cron.scheduler.tick takes cron/.tick.lock, so the two
+    # processes alternate ticks, and every tick this serve wins spawns the
+    # due cron jobs as in-process agent threads — competing with the
+    # run_in_executor pool that serves /api/profiles, /api/profiles/sessions
+    # and friends. On homes with heavy cron (100+ jobs) that starves the
+    # dashboard's own data endpoints: the sidebar times out and renders
+    # "no profiles / no sessions" while the serve pegs 200%+ CPU. The
+    # gateway is already ticking; don't tick a second scheduler.
     cron_stop: "threading.Event | None" = None
     cron_thread: "threading.Thread | None" = None
     if os.getenv("HERMES_DESKTOP") == "1":
-        cron_stop = threading.Event()
-        cron_thread = threading.Thread(
-            target=_start_desktop_cron_ticker,
-            args=(cron_stop,),
-            daemon=True,
-            name="desktop-cron-ticker",
-        )
-        cron_thread.start()
+        try:
+            from gateway.status import is_gateway_running
+
+            gateway_already_running = is_gateway_running()
+        except Exception:
+            # Probe failure must not break boot — fall back to legacy
+            # behavior (start the ticker) rather than skipping it.
+            gateway_already_running = False
+        if not gateway_already_running:
+            cron_stop = threading.Event()
+            cron_thread = threading.Thread(
+                target=_start_desktop_cron_ticker,
+                args=(cron_stop,),
+                daemon=True,
+                name="desktop-cron-ticker",
+            )
+            cron_thread.start()
 
     # Reap idle/dead keep-alive PTY sessions in the background (30-min TTL).
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))
