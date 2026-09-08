@@ -234,16 +234,17 @@ class SessionGatewayMixin:
                     """INSERT INTO sessions (
                                id, source, user_id, session_key, chat_id,
                                chat_type, thread_id, display_name, origin_json,
-                               profile_name, started_at
+                               profile_name, started_at, archived
                            )
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                            ON CONFLICT(id) DO UPDATE SET
                                session_key = COALESCE(sessions.session_key, excluded.session_key),
                                chat_id = COALESCE(sessions.chat_id, excluded.chat_id),
                                chat_type = COALESCE(sessions.chat_type, excluded.chat_type),
                                thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
                                display_name = COALESCE(sessions.display_name, excluded.display_name),
-                               origin_json = COALESCE(sessions.origin_json, excluded.origin_json)""",
+                               origin_json = COALESCE(sessions.origin_json, excluded.origin_json),
+                               archived = COALESCE(sessions.archived, 0)""",
                     # Same ownership stamp as _insert_session_row: an unowned (NULL) row
                     # vanishes from profile-keyed consumers.
                     (session_id, source, user_id, session_key, chat_id, chat_type, thread_id, display_name,

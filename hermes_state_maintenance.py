@@ -253,7 +253,7 @@ class SessionMaintenanceMixin:
         rows = self._read_all(
             f"""
             SELECT s.id FROM sessions s
-            WHERE s.archived = 0
+            WHERE COALESCE(s.archived, 0) = 0
               AND COALESCE(s.end_reason, '') <> 'compression'
               {pin_clause}
               AND {_sql_session_last_active("s")} < ?

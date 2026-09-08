@@ -120,9 +120,9 @@ def _session_filter_where(
             where.append(clause)
             params.extend(values)
     if archived_only:
-        where.append("s.archived = 1")
+        where.append("COALESCE(s.archived, 0) = 1")
     elif not include_archived:
-        where.append("s.archived = 0")
+        where.append("COALESCE(s.archived, 0) = 0")
     return where, params
 
 
@@ -999,8 +999,8 @@ class SessionSessionsMixin:
         lineage_limit = max(candidate_limit, min(int(lineage_limit), 8192))
 
         candidate_clauses = [
-            "s.archived = 0",
-            "s.hidden = 0",
+            "COALESCE(s.archived, 0) = 0",
+            "COALESCE(s.hidden, 0) = 0",
             f"{_delegate_from_json('s.model_config')} IS NULL",
         ]
         candidate_params: List[Any] = []
@@ -1112,8 +1112,8 @@ class SessionSessionsMixin:
             JOIN sessions s ON s.id = rt.root_id
             JOIN sessions tip ON tip.id = rt.cur_id
             WHERE rt.rank_in_root = 1
-              AND s.archived = 0
-              AND s.hidden = 0
+              AND COALESCE(s.archived, 0) = 0
+              AND COALESCE(s.hidden, 0) = 0
               AND {_LISTABLE_CHILD_SQL}
               AND {_delegate_from_json('s.model_config')} IS NULL
             ORDER BY rt.activity DESC, s.started_at DESC, tip.id DESC
@@ -1533,7 +1533,7 @@ class SessionSessionsMixin:
     # The ``NOT EXISTS`` probe is the authority; : ``message_count = 0`` stays as a cheap prefilter. Same
     # shape as every : other emptiness guard in this module. (#95868)
     _EMPTY_SESSION_WHERE = (
-        "message_count = 0 AND ended_at IS NOT NULL AND archived = 0 AND NOT EXISTS ("
+        "message_count = 0 AND ended_at IS NOT NULL AND COALESCE(archived, 0) = 0 AND NOT EXISTS ("
         "SELECT 1 FROM messages WHERE messages.session_id = sessions.id)"
     )
 

@@ -158,7 +158,7 @@ class SessionPortabilityMixin:
         workspace signal)."""
         where = "cwd IS NOT NULL AND TRIM(cwd) != ''"
         if not include_archived:
-            where += " AND archived = 0"
+            where += " AND COALESCE(archived, 0) = 0"
         rows = self._read_rows(
             "SELECT cwd AS cwd, COUNT(*) AS sessions, MAX(COALESCE(ended_at, started_at, 0)) AS last_active "
             f"FROM sessions WHERE {where} GROUP BY cwd"
