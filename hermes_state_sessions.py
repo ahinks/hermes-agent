@@ -116,7 +116,15 @@ def _session_filter_where(
         ("s.session_key = ?", [session_key] if session_key else []),
         (f"s.source NOT IN ({_session_ids_placeholders(exclude_sources or ())})", exclude_sources or []),
         (_cwd_prefix_clause(cwd_prefix) if cwd_prefix else ("", [])),
-        ("s.message_count >= ?", [min_message_count] if min_message_count > 0 else []),
+        # COALESCE NULL message_count to 1: live sessions whose gateway hasn't
+        # finalized message_count yet (RECENT discord/telegram/slack writes
+        # leave it NULL on close — the messages table shows them populated,
+        # but `s.message_count >= 1` would silently drop them). Verified
+        # 2026-09-22 against /api/profiles/sessions: without this guard
+        # the 17 most recent discord chats were invisible to the sidebar.
+        # The companion fix is in the gateway's session-finalize path; this
+        # COALESCE is the durable UI-side escape hatch until that lands.
+        ("COALESCE(s.message_count, 1) >= ?", [min_message_count] if min_message_count > 0 else []),
     ):
         if values:
             where.append(clause)
