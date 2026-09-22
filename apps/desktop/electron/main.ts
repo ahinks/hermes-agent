@@ -12769,6 +12769,24 @@ async function runPoolBackendStart(profile, entry, opts: { forceLocal?: boolean;
     )
   }
 
+  // Persist the live (ephemeral-port, just-minted-token) primary backend so a
+  // later cold start of the renderer reads the correct url/token instead of
+  // the stale value from the previous spawn. The desktop spawns each backend
+  // with `--port 0`; without this write, connection.json keeps pointing at
+  // the old port and the renderer silently serves empty Profiles/Sessions.
+  // Wrapped so a write failure never breaks boot — the in-memory backend
+  // connection is the source of truth for the running window.
+  try {
+    const previousProfiles = readDesktopConnectionConfig().profiles || {}
+    writeDesktopConnectionConfig({
+      mode: 'local',
+      remote: { url: baseUrl, authMode: 'token', token: authToken },
+      profiles: previousProfiles
+    })
+  } catch (writeErr) {
+    rememberLog(`Failed to persist connection.json for profile "${profile}": ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`)
+  }
+
   return {
     baseUrl,
     mode: 'local',
@@ -13552,6 +13570,22 @@ async function runHermesStart() {
       throw new Error(
         `Local Hermes backend is HTTP-reachable but the WebSocket (/api/ws) rejected the session token: ${wsProbe.reason}`
       )
+    }
+
+    // Persist the live primary backend (ephemeral port + freshly minted
+    // session token) so a later renderer cold start reads the correct
+    // url/token from connection.json instead of the previous spawn's dead
+    // port. The spawn uses `--port 0`; without this write the next launch
+    // hits 401 and shows empty Profiles/Sessions.
+    try {
+      const previousProfiles = readDesktopConnectionConfig().profiles || {}
+      writeDesktopConnectionConfig({
+        mode: 'local',
+        remote: { url: baseUrl, authMode: 'token', token: authToken },
+        profiles: previousProfiles
+      })
+    } catch (writeErr) {
+      rememberLog(`Failed to persist connection.json on primary boot: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`)
     }
 
     updateBootProgress({
